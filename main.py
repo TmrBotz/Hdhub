@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import re
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 
@@ -17,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── MongoDB Setup ──
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["hdhub4u"]
@@ -29,6 +28,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
@@ -63,35 +63,25 @@ async def startup_event():
     await posts_collection.create_index("post_url", unique=True)
 
 
-def extract_all_post_urls(home_html: str) -> List[str]:
-    anchor_rx = re.compile(r'<a\s+href="(https?://[^"]+)"', re.IGNORECASE)
-    seen = set()
-    urls = []
-
-    for match in anchor_rx.finditer(home_html):
-        url = match.group(1)
-
-        if any(skip in url for skip in SKIP):
-            continue
-        if "/category/" in url or "/page/" in url:
-            continue
-        if "hdhub4u.cl" not in url:
-            continue
-
-        # Homepage skip
-        if re.fullmatch(r"https?://[^/]+/?", url):
-            continue
-
-        # Slug kam se kam 5 chars
-        if not re.search(r"hdhub4u\.cl/[a-z0-9-]{5,}", url):
-            continue
-
-        clean_url = url.split("?")[0].rstrip("/")
-        if clean_url not in seen:
-            seen.add(clean_url)
-            urls.append(clean_url)
-
-    return urls
+# ── Tera original extract_post_url — bilkul same ──
+def extract_post_url(home_html: str) -> Optional[str]:
+    patterns = [
+        r'class="recent-movies"[\s\S]*?<a\s+href="(https?://[^"]+)"',
+        r'class="thumb[^"]*"[\s\S]*?<a\s+href="(https?://new1\.hdhub4u\.cl/[^"]+)"',
+        r'<figure>[\s\S]*?<a\s+href="(https?://new1\.hdhub4u\.cl/[^"]+)"',
+        r'href="(https?://new[0-9]*\.hdhub4u\.cl/[a-z0-9][a-z0-9-]{5,}/?)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, home_html)
+        if match:
+            url = match.group(1)
+            if (
+                "/category/" not in url
+                and "/page/" not in url
+                and not url.endswith(".cl/")
+            ):
+                return url
+    return None
 
 
 def extract_title(post_html: str) -> str:
@@ -149,8 +139,30 @@ def extract_links(post_html: str) -> list:
     return links
 
 
-async def scrape_and_save_post(post_url: str) -> Optional[dict]:
+@app.get("/latest")
+async def latest(post: Optional[str] = Query(None)):
     try:
+        post_url = post
+
+        # STEP 1: Homepage → Latest post URL (tera original logic)
+        if not post_url:
+            home_html = await fetch_html(BASE_URL)
+            post_url = extract_post_url(home_html)
+
+            if not post_url:
+                return err("Latest post link not found", debug=home_html[:500])
+
+        # STEP 2: Duplicate check — pehle DB mein dekho
+        existing = await posts_collection.find_one({"post_url": post_url})
+        if existing:
+            return JSONResponse({
+                "success": True,
+                "message": "No new post — already in DB",
+                "post_url": post_url,
+                "new": False,
+            })
+
+        # STEP 3: Naya hai — scrape karo
         post_html = await fetch_html(post_url)
 
         doc = {
@@ -162,55 +174,19 @@ async def scrape_and_save_post(post_url: str) -> Optional[dict]:
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         }
 
+        # STEP 4: MongoDB mein save karo
         await posts_collection.insert_one(doc)
         doc.pop("_id", None)
-        return doc
-
-    except Exception as e:
-        error_str = str(e).lower()
-        if "duplicate" in error_str or "e11000" in error_str:
-            return None
-        print(f"[ERROR] {post_url}: {e}")
-        return None
-
-
-@app.get("/latest")
-async def latest(post: Optional[str] = Query(None)):
-    try:
-        if post:
-            result = await scrape_and_save_post(post)
-            if result is None:
-                return JSONResponse({
-                    "success": True,
-                    "message": "Post already exists in DB (duplicate skipped)",
-                    "new_posts": [],
-                    "new_count": 0,
-                })
-            return JSONResponse({
-                "success": True,
-                "new_posts": [result],
-                "new_count": 1,
-            })
-
-        home_html = await fetch_html(BASE_URL)
-        all_urls = extract_all_post_urls(home_html)
-
-        if not all_urls:
-            return err("Koi post URL homepage se nahi mila", debug=home_html[:500])
-
-        new_posts = []
-        for url in all_urls:
-            result = await scrape_and_save_post(url)
-            if result is not None:
-                new_posts.append(result)
 
         return JSONResponse({
             "success": True,
-            "scraped_at": datetime.now(timezone.utc).isoformat(),
-            "total_found_on_homepage": len(all_urls),
-            "new_count": len(new_posts),
-            "already_in_db": len(all_urls) - len(new_posts),
-            "new_posts": new_posts,
+            "new": True,
+            "scraped_at": doc["scraped_at"],
+            "post_url": post_url,
+            "title": doc["title"],
+            "thumbnail": doc["thumbnail"],
+            "info": doc["info"],
+            "download_links": doc["download_links"],
         })
 
     except httpx.HTTPStatusError as e:
@@ -221,27 +197,6 @@ async def latest(post: Optional[str] = Query(None)):
         return err(str(e))
 
 
-@app.get("/posts")
-async def get_all_posts(limit: int = Query(20), skip: int = Query(0)):
-    cursor = posts_collection.find({}, {"_id": 0}).sort("scraped_at", -1).skip(skip).limit(limit)
-    posts = await cursor.to_list(length=limit)
-    total = await posts_collection.count_documents({})
-    return JSONResponse({
-        "success": True,
-        "total_in_db": total,
-        "returned": len(posts),
-        "posts": posts,
-    })
-
-
 @app.get("/")
 async def root():
-    return {
-        "status": "ok",
-        "endpoints": {
-            "/latest": "Homepage scrape — naye posts save, sirf naye return",
-            "/latest?post=<url>": "Specific post scrape",
-            "/posts": "DB ke saare saved posts",
-            "/posts?limit=10&skip=0": "Pagination ke saath",
-        }
-    }
+    return {"status": "ok", "endpoints": ["/latest", "/latest?post=<url>"]}
