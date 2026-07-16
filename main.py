@@ -39,15 +39,18 @@ def err(message: str, status: int = 500, **extra):
 
 
 async def fetch_html(url: str) -> str:
+    # Accept-Encoding hata do — httpx khud handle karta hai decompression
+    headers = {k: v for k, v in HEADERS.items() if k != "Accept-Encoding"}
     async with httpx.AsyncClient(
-        headers=HEADERS,
+        headers=headers,
         follow_redirects=True,
         timeout=30,
-        verify=False,  # SSL issues bypass
+        verify=False,
     ) as client:
         response = await client.get(url)
         response.raise_for_status()
-        return response.text
+        # Force UTF-8 decode
+        return response.content.decode("utf-8", errors="replace")
 
 
 # ── Scraping Logic (same as CF Worker) ──
