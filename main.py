@@ -9,7 +9,6 @@ from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI()
@@ -30,7 +29,6 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 DB_NAME = "hdhub4u"
 COLLECTION_NAME = "posts"
 
-# MongoDB client
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client[DB_NAME]
 collection = db[COLLECTION_NAME]
@@ -52,10 +50,6 @@ HEADERS = {
 SKIP = ["hdhub4u", "how-to", "whatsapp", "youtube", "imdb", "catimages", "gravatar"]
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def err(message: str, status: int = 500, **extra):
     return JSONResponse({"success": False, "error": message, **extra}, status_code=status)
 
@@ -73,38 +67,62 @@ async def fetch_html(url: str) -> str:
         return response.content.decode("utf-8", errors="replace")
 
 
-def extract_post_id(post_url: str) -> Optional[str]:
-    """Extract post ID from URL (slug after domain)"""
-    # URL: https://new3.hdhub4u.cl/khushkhabri-2026-punjabi-webrip-full-movie/
-    # Returns: khushkhabri-2026-punjabi-webrip-full-movie
-    match = re.search(r'\.cl/([^/?]+)/?$', post_url)
-    return match.group(1) if match else None
+# ============================================================
+# ORIGINAL SCRAPING LOGIC (EXACTLY AS YOU HAD)
+# ============================================================
+
+def extract_post_url(home_html: str) -> Optional[str]:
+    """Extract single latest post URL"""
+    patterns = [
+        r'class="recent-movies"[\s\S]*?<a\s+href="(https?://[^"]+)"',
+        r'class="thumb[^"]*"[\s\S]*?<a\s+href="(https?://new1\.hdhub4u\.cl/[^"]+)"',
+        r'<figure>[\s\S]*?<a\s+href="(https?://new1\.hdhub4u\.cl/[^"]+)"',
+        r'href="(https?://new[0-9]*\.hdhub4u\.cl/[a-z0-9][a-z0-9-]{5,}/?)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, home_html)
+        if match:
+            url = match.group(1)
+            if (
+                "/category/" not in url
+                and "/page/" not in url
+                and not url.endswith(".cl/")
+            ):
+                return url
+    return None
 
 
 def extract_all_post_urls(home_html: str) -> list:
-    """Extract all post URLs from homepage"""
+    """Extract ALL post URLs from homepage"""
     urls = []
-    
     patterns = [
         r'class="recent-movies"[\s\S]*?<a\s+href="(https?://[^"]+)"',
-        r'class="thumb[^"]*"[\s\S]*?<a\s+href="(https?://new[0-9]*\.hdhub4u\.cl/[^"]+)"',
-        r'<figure>[\s\S]*?<a\s+href="(https?://new[0-9]*\.hdhub4u\.cl/[^"]+)"',
+        r'class="thumb[^"]*"[\s\S]*?<a\s+href="(https?://new1\.hdhub4u\.cl/[^"]+)"',
+        r'<figure>[\s\S]*?<a\s+href="(https?://new1\.hdhub4u\.cl/[^"]+)"',
         r'href="(https?://new[0-9]*\.hdhub4u\.cl/[a-z0-9][a-z0-9-]{5,}/?)"',
     ]
-    
     for pattern in patterns:
         matches = re.findall(pattern, home_html)
         for url in matches:
-            # Filter unwanted URLs
-            if ("/category/" not in url and 
-                "/page/" not in url and 
-                not url.endswith(".cl/") and
-                not url.endswith(".cl") and
-                not any(skip in url for skip in SKIP)):
+            if (
+                "/category/" not in url
+                and "/page/" not in url
+                and not url.endswith(".cl/")
+                and not any(skip in url for skip in SKIP)
+            ):
                 urls.append(url)
     
-    # Remove duplicates while preserving order
+    # Remove duplicates
     return list(dict.fromkeys(urls))
+
+
+def extract_post_id(post_url: str) -> str:
+    """Extract ID from URL (use slug as ID)"""
+    # https://new3.hdhub4u.cl/khushkhabri-2026-punjabi-webrip-full-movie/
+    match = re.search(r'\.cl/([^/?]+)/?$', post_url)
+    if match:
+        return match.group(1)
+    return post_url.split("/")[-2] if post_url.endswith("/") else post_url.split("/")[-1]
 
 
 def extract_title(post_html: str) -> str:
@@ -163,36 +181,25 @@ def extract_links(post_html: str) -> list:
 
 
 # ============================================================
-# MAIN ENDPOINT: GET /latest
+# MAIN ENDPOINT - WITH MONGODB + DUPLICATE FILTER
 # ============================================================
 
 @app.get("/latest")
 async def latest(post: Optional[str] = Query(None)):
-    """
-    Fetch latest post(s) from HDHub4u
-    
-    - If no 'post' parameter: Scrape homepage, find all new posts, process only the latest one
-    - If 'post' parameter provided: Process that specific URL (with duplicate check)
-    """
     try:
         # ── CASE 1: Specific URL provided ──
         if post:
             post_url = post
             post_id = extract_post_id(post_url)
             
-            if not post_id:
-                return err("Invalid post URL - could not extract post ID")
-            
-            # Check if already exists in MongoDB
+            # Check if already exists
             existing = collection.find_one({"post_id": post_id})
             if existing:
                 return JSONResponse({
                     "success": True,
                     "message": "Post already exists in database",
                     "post_id": post_id,
-                    "post_url": post_url,
-                    "already_saved": True,
-                    "saved_at": existing.get("scraped_at")
+                    "already_saved": True
                 })
             
             # Scrape specific post
@@ -208,7 +215,6 @@ async def latest(post: Optional[str] = Query(None)):
                 "scraped_at": datetime.now(timezone.utc).isoformat()
             }
             
-            # Save to MongoDB
             collection.insert_one(post_data)
             
             return JSONResponse({
@@ -217,20 +223,22 @@ async def latest(post: Optional[str] = Query(None)):
                 "post": post_data
             })
         
-        # ── CASE 2: No URL - Get latest from homepage ──
+        # ── CASE 2: Auto-detect latest ──
         else:
-            # Step 1: Fetch homepage
+            # Step 1: Homepage
             home_html = await fetch_html(BASE_URL)
+            
+            # Step 2: Get ALL posts from homepage
             all_post_urls = extract_all_post_urls(home_html)
             
             if not all_post_urls:
                 return err("No posts found on homepage")
             
-            # Step 2: Get existing post IDs from MongoDB
+            # Step 3: MongoDB existing IDs
             existing_docs = collection.find({}, {"post_id": 1, "_id": 0}).to_list()
             existing_ids = set(doc["post_id"] for doc in existing_docs)
             
-            # Step 3: Filter new posts
+            # Step 4: Filter new posts
             new_posts = []
             for url in all_post_urls:
                 post_id = extract_post_id(url)
@@ -240,23 +248,18 @@ async def latest(post: Optional[str] = Query(None)):
                         "post_id": post_id
                     })
             
-            # Step 4: If no new posts
             if not new_posts:
                 return JSONResponse({
                     "success": True,
                     "message": "No new posts found - all already in database",
-                    "total_posts_found": len(all_post_urls),
-                    "new_posts_count": 0,
-                    "posts": []
+                    "total_posts": len(all_post_urls),
+                    "new_posts": 0
                 })
             
-            # Step 5: Process ONLY FIRST new post (latest)
+            # Step 5: Process ONLY FIRST new post (sabse naya)
             first_post = new_posts[0]
-            
-            # Scrape post page
             post_html = await fetch_html(first_post["post_url"])
             
-            # Extract all data
             post_data = {
                 "post_id": first_post["post_id"],
                 "post_url": first_post["post_url"],
@@ -267,21 +270,14 @@ async def latest(post: Optional[str] = Query(None)):
                 "scraped_at": datetime.now(timezone.utc).isoformat()
             }
             
-            # Save to MongoDB
             collection.insert_one(post_data)
             
-            # Return response
             return JSONResponse({
                 "success": True,
                 "message": "New post saved successfully",
-                "total_posts_found": len(all_post_urls),
-                "new_posts_available": len(new_posts),
-                "remaining_new_posts": len(new_posts) - 1,
-                "post": post_data,
-                "new_posts_list": [
-                    {"post_id": p["post_id"], "post_url": p["post_url"]} 
-                    for p in new_posts[1:6]  # Show next 5 new posts
-                ]
+                "total_posts": len(all_post_urls),
+                "remaining_new": len(new_posts) - 1,
+                "post": post_data
             })
     
     except httpx.HTTPStatusError as e:
@@ -298,70 +294,21 @@ async def latest(post: Optional[str] = Query(None)):
 
 @app.get("/")
 async def root():
-    return {
-        "status": "ok", 
-        "service": "HDHub4u Scraper",
-        "endpoints": [
-            "/latest - Get latest post (auto-detect)",
-            "/latest?post=<url> - Get specific post",
-            "/all - Get all posts from homepage (without saving)",
-            "/saved - Get saved posts from database"
-        ]
-    }
-
-
-@app.get("/all")
-async def get_all_posts():
-    """Get all posts from homepage without saving to database"""
-    try:
-        home_html = await fetch_html(BASE_URL)
-        all_post_urls = extract_all_post_urls(home_html)
-        
-        if not all_post_urls:
-            return err("No posts found on homepage")
-        
-        posts = []
-        for url in all_post_urls[:20]:  # Limit to 20 for performance
-            post_id = extract_post_id(url)
-            posts.append({
-                "post_id": post_id,
-                "post_url": url
-            })
-        
-        return JSONResponse({
-            "success": True,
-            "total_posts": len(all_post_urls),
-            "posts": posts
-        })
-    
-    except Exception as e:
-        return err(str(e))
+    return {"status": "ok", "endpoints": ["/latest", "/latest?post=<url>", "/saved", "/health"]}
 
 
 @app.get("/saved")
 async def get_saved_posts(limit: int = Query(50, ge=1, le=100)):
-    """Get saved posts from MongoDB"""
     try:
-        posts = collection.find(
-            {}, 
-            {"_id": 0}
-        ).sort("scraped_at", -1).limit(limit).to_list()
-        
-        return JSONResponse({
-            "success": True,
-            "count": len(posts),
-            "posts": posts
-        })
-    
+        posts = collection.find({}, {"_id": 0}).sort("scraped_at", -1).limit(limit).to_list()
+        return JSONResponse({"success": True, "count": len(posts), "posts": posts})
     except Exception as e:
         return err(str(e))
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     try:
-        # Check MongoDB connection
         collection.find_one({})
         db_status = "connected"
     except:
@@ -370,13 +317,12 @@ async def health():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "mongodb": db_status,
-        "base_url": BASE_URL
+        "mongodb": db_status
     }
 
 
 # ============================================================
-# RUN SERVER
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
