@@ -58,19 +58,12 @@ async def fetch_html(url: str) -> str:
         return response.content.decode("utf-8", errors="replace")
 
 
-# ── MongoDB Startup: Unique Index ──
 @app.on_event("startup")
 async def startup_event():
-    # post_url pe unique index — duplicate automatically reject hoga
     await posts_collection.create_index("post_url", unique=True)
 
 
-# ── Scraping Logic ──
-
 def extract_all_post_urls(home_html: str) -> List[str]:
-    """
-    Homepage se SAARE post URLs extract karo (sirf latest nahi).
-    """
     anchor_rx = re.compile(r'<a\s+href="(https?://[^"]+)"', re.IGNORECASE)
     seen = set()
     urls = []
@@ -78,22 +71,19 @@ def extract_all_post_urls(home_html: str) -> List[str]:
     for match in anchor_rx.finditer(home_html):
         url = match.group(1)
 
-        # Skip categories, pages, homepage itself
-        if (
-            "/category/" in url
-            or "/page/" in url
-            or url.rstrip("/") == BASE_URL.rstrip("/")
-            or any(skip in url for skip in SKIP)
-        ):
+        if any(skip in url for skip in SKIP):
+            continue
+        if "/category/" in url or "/page/" in url:
+            continue
+        if "hdhub4u.cl" not in url:
             continue
 
-        # Sirf hdhub4u domain ke post URLs lo
-        if not re.search(r"new\d*\.hdhub4u\.cl/", url):
+        # Homepage skip
+        if re.fullmatch(r"https?://[^/]+/?", url):
             continue
 
-        # Slug hona chahiye (at least 5 chars after domain)
-        slug_match = re.search(r"hdhub4u\.cl/([a-z0-9][a-z0-9-]{4,})", url)
-        if not slug_match:
+        # Slug kam se kam 5 chars
+        if not re.search(r"hdhub4u\.cl/[a-z0-9-]{5,}", url):
             continue
 
         clean_url = url.split("?")[0].rstrip("/")
@@ -160,10 +150,6 @@ def extract_links(post_html: str) -> list:
 
 
 async def scrape_and_save_post(post_url: str) -> Optional[dict]:
-    """
-    Ek post scrape karo aur MongoDB me save karo.
-    Agar already exist kare to None return karo (duplicate).
-    """
     try:
         post_html = await fetch_html(post_url)
 
@@ -176,35 +162,21 @@ async def scrape_and_save_post(post_url: str) -> Optional[dict]:
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        # insert_one — unique index ki wajah se duplicate automatically fail hoga
         await posts_collection.insert_one(doc)
-
-        # MongoDB ka _id remove karo response ke liye
         doc.pop("_id", None)
         return doc
 
     except Exception as e:
         error_str = str(e).lower()
         if "duplicate" in error_str or "e11000" in error_str:
-            # Duplicate — silently skip
             return None
-        # Real error — log karo
         print(f"[ERROR] {post_url}: {e}")
         return None
 
 
-# ── Routes ──
-
 @app.get("/latest")
 async def latest(post: Optional[str] = Query(None)):
-    """
-    - post=<url> doge to sirf wo scrape hoga
-    - Bina post ke: Homepage ke SAARE posts scrape hoge,
-      naye wale MongoDB me save honge,
-      aur sirf NAYE posts return honge.
-    """
     try:
-        # ── Single post mode ──
         if post:
             result = await scrape_and_save_post(post)
             if result is None:
@@ -220,7 +192,6 @@ async def latest(post: Optional[str] = Query(None)):
                 "new_count": 1,
             })
 
-        # ── Homepage full scrape mode ──
         home_html = await fetch_html(BASE_URL)
         all_urls = extract_all_post_urls(home_html)
 
@@ -230,7 +201,7 @@ async def latest(post: Optional[str] = Query(None)):
         new_posts = []
         for url in all_urls:
             result = await scrape_and_save_post(url)
-            if result is not None:  # None = duplicate tha
+            if result is not None:
                 new_posts.append(result)
 
         return JSONResponse({
@@ -252,9 +223,6 @@ async def latest(post: Optional[str] = Query(None)):
 
 @app.get("/posts")
 async def get_all_posts(limit: int = Query(20), skip: int = Query(0)):
-    """
-    MongoDB me saved saare posts dekho (pagination ke saath).
-    """
     cursor = posts_collection.find({}, {"_id": 0}).sort("scraped_at", -1).skip(skip).limit(limit)
     posts = await cursor.to_list(length=limit)
     total = await posts_collection.count_documents({})
@@ -271,9 +239,9 @@ async def root():
     return {
         "status": "ok",
         "endpoints": {
-            "/latest": "Homepage scrape karo — naye posts save karo, sirf naye return karo",
-            "/latest?post=<url>": "Specific post scrape karo",
-            "/posts": "DB me saved saare posts dekho",
-            "/posts?limit=10&skip=0": "Pagination ke saath posts",
+            "/latest": "Homepage scrape — naye posts save, sirf naye return",
+            "/latest?post=<url>": "Specific post scrape",
+            "/posts": "DB ke saare saved posts",
+            "/posts?limit=10&skip=0": "Pagination ke saath",
         }
     }
