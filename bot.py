@@ -10,6 +10,7 @@ from flask import Flask
 from dotenv import load_dotenv
 import json
 import logging
+from fake_useragent import UserAgent
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,13 +45,29 @@ SKIP_LABELS = [
     "Instant",
 ]
 
+# ExtraFlix headers to bypass bot detection
+EXTRAFLIX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+    "Referer": "https://e5.extraflix.mobi/",
+    "DNT": "1",
+}
+
 # ─── MongoDB ──────────────────────────────────────────────────────────────────
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = client["hdhub4u_bot"]
     col_hdhub4u = db["sent_posts"]
     col_extraflix = db["sent_posts_extraflix"]
-    # Test connection
     client.admin.command('ping')
     logger.info("✅ MongoDB connected successfully")
 except Exception as e:
@@ -71,6 +88,12 @@ def status():
         "hdhub4u_count": col_hdhub4u.count_documents({}),
         "extraflix_count": col_extraflix.count_documents({})
     }, 200
+
+@app.route("/test")
+def test():
+    """Test endpoint to check ExtraFlix scraping"""
+    urls = get_latest_extraflix_urls()
+    return {"urls_found": len(urls), "urls": urls[:5]}, 200
 
 # ─── HDHub4u Functions ──────────────────────────────────────────────────────
 
@@ -97,12 +120,6 @@ def get_latest_hdhub4u_urls():
         logger.info(f"[HDHub4u] Found {len(urls)} post URLs")
         return urls
 
-    except requests.exceptions.Timeout:
-        logger.error("[HDHub4u] Homepage scrape timeout")
-        return []
-    except requests.exceptions.ConnectionError:
-        logger.error("[HDHub4u] Homepage connection error")
-        return []
     except Exception as e:
         logger.error(f"[HDHub4u] Homepage scrape failed: {e}")
         return []
@@ -126,9 +143,6 @@ def scrape_hdhub4u_post(post_url):
 
         return data
 
-    except requests.exceptions.Timeout:
-        logger.error(f"[HDHub4u API] Timeout for {post_url}")
-        return None
     except Exception as e:
         logger.error(f"[HDHub4u API] Failed for {post_url}: {e}")
         return None
@@ -180,15 +194,88 @@ def build_hdhub4u_message(data):
 def get_latest_extraflix_urls():
     """Scrape ExtraFlix homepage and return top N post URLs."""
     try:
+        # Create a session with proper headers
+        session = requests.Session()
+        session.headers.update(EXTRAFLIX_HEADERS)
+        
+        # First hit the homepage to get cookies
+        resp = session.get(EXTRAFLIX_URL, timeout=30)
+        resp.raise_for_status()
+        
+        logger.info(f"[ExtraFlix] Status code: {resp.status_code}")
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Try multiple selectors for different page structures
+        articles = soup.select("article.entry-card")
+        if not articles:
+            articles = soup.select(".entry-card")
+        if not articles:
+            articles = soup.select("article.post")
+        if not articles:
+            articles = soup.select(".post-item")
+        if not articles:
+            articles = soup.select("div[class*='post']")
+            
+        logger.info(f"[ExtraFlix] Found {len(articles)} articles")
+        
+        urls = []
+        for article in articles[:TOP_N]:
+            # Try different link selectors
+            title_link = article.select_one("h2.entry-title a")
+            if not title_link:
+                title_link = article.select_one("h2 a")
+            if not title_link:
+                title_link = article.select_one(".entry-title a")
+            if not title_link:
+                title_link = article.select_one("a[rel='bookmark']")
+            
+            if title_link and title_link.get("href"):
+                url = title_link["href"].strip()
+                if url and url.startswith("http"):
+                    urls.append(url)
+                elif url:
+                    # Handle relative URLs
+                    full_url = urljoin(EXTRAFLIX_URL, url)
+                    urls.append(full_url)
+
+        logger.info(f"[ExtraFlix] Found {len(urls)} post URLs")
+        return urls
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            logger.error("[ExtraFlix] 403 Forbidden - Website blocking bot. Trying alternative method...")
+            # Try with different user agents
+            return get_latest_extraflix_urls_alternative()
+    except Exception as e:
+        logger.error(f"[ExtraFlix] Homepage scrape failed: {e}")
+        return []
+
+
+def get_latest_extraflix_urls_alternative():
+    """Alternative method to scrape ExtraFlix using different headers"""
+    try:
+        ua = UserAgent()
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            "User-Agent": ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
         }
+        
         resp = requests.get(EXTRAFLIX_URL, headers=headers, timeout=30)
         resp.raise_for_status()
-
+        
         soup = BeautifulSoup(resp.text, "html.parser")
         articles = soup.select("article.entry-card")
-
+        
         urls = []
         for article in articles[:TOP_N]:
             title_link = article.select_one("h2.entry-title a")
@@ -196,18 +283,12 @@ def get_latest_extraflix_urls():
                 url = title_link["href"].strip()
                 if url:
                     urls.append(url)
-
-        logger.info(f"[ExtraFlix] Found {len(urls)} post URLs")
+        
+        logger.info(f"[ExtraFlix Alternative] Found {len(urls)} post URLs")
         return urls
-
-    except requests.exceptions.Timeout:
-        logger.error("[ExtraFlix] Homepage scrape timeout")
-        return []
-    except requests.exceptions.ConnectionError:
-        logger.error("[ExtraFlix] Homepage connection error")
-        return []
+        
     except Exception as e:
-        logger.error(f"[ExtraFlix] Homepage scrape failed: {e}")
+        logger.error(f"[ExtraFlix Alternative] Failed: {e}")
         return []
 
 
@@ -226,9 +307,6 @@ def scrape_extraflix_post(post_url):
 
         return data
 
-    except requests.exceptions.Timeout:
-        logger.error(f"[ExtraFlix API] Timeout for {post_url}")
-        return None
     except Exception as e:
         logger.error(f"[ExtraFlix API] Failed for {post_url}: {e}")
         return None
@@ -390,12 +468,10 @@ def run_all_jobs():
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 
 def start_scheduler():
-    # Wait 5 seconds before first run to let Flask start
     time.sleep(5)
     logger.info("🚀 Running initial job...")
     run_all_jobs()
 
-    # Schedule every 10 minutes
     schedule.every(10).minutes.do(run_all_jobs)
     logger.info("⏰ Scheduler started - running every 10 minutes")
 
@@ -411,7 +487,6 @@ def start_scheduler():
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Check environment variables
     required_vars = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_ID", "TELEGRAM_CHANNEL_ID_2", "MONGO_URI"]
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
@@ -421,12 +496,10 @@ if __name__ == "__main__":
     
     logger.info("✅ All environment variables set")
     
-    # Start scheduler
     scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
     scheduler_thread.start()
     logger.info("🔄 Scheduler thread started")
 
-    # Start Flask
     port = int(os.getenv("PORT", 8080))
     logger.info(f"🌐 Starting Flask server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
