@@ -4,13 +4,13 @@ import schedule
 import time
 import threading
 import html
+import cloudscraper
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
 from flask import Flask
 from dotenv import load_dotenv
-import json
 import logging
-from fake_useragent import UserAgent
+from urllib.parse import urljoin
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,7 +45,7 @@ SKIP_LABELS = [
     "Instant",
 ]
 
-# ExtraFlix headers to bypass bot detection
+# ExtraFlix headers
 EXTRAFLIX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -189,24 +189,34 @@ def build_hdhub4u_message(data):
     return "\n".join(lines)
 
 
-# ─── ExtraFlix Functions ────────────────────────────────────────────────────
+# ─── ExtraFlix Functions (Cloudscraper) ────────────────────────────────────
 
 def get_latest_extraflix_urls():
-    """Scrape ExtraFlix homepage and return top N post URLs."""
+    """Scrape ExtraFlix using cloudscraper to bypass Cloudflare/anti-bot protection"""
     try:
-        # Create a session with proper headers
-        session = requests.Session()
-        session.headers.update(EXTRAFLIX_HEADERS)
+        logger.info("[ExtraFlix] Creating cloudscraper session...")
         
-        # First hit the homepage to get cookies
-        resp = session.get(EXTRAFLIX_URL, timeout=30)
+        # Create cloudscraper with browser emulation
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            },
+            interpret=True  # Interpret JavaScript
+        )
+        
+        # First request to get the page
+        logger.info(f"[ExtraFlix] Fetching: {EXTRAFLIX_URL}")
+        resp = scraper.get(EXTRAFLIX_URL, headers=EXTRAFLIX_HEADERS, timeout=60)
         resp.raise_for_status()
         
-        logger.info(f"[ExtraFlix] Status code: {resp.status_code}")
+        logger.info(f"[ExtraFlix] Status code: {resp.status_code}, Content length: {len(resp.text)}")
         
+        # Parse HTML
         soup = BeautifulSoup(resp.text, "html.parser")
         
-        # Try multiple selectors for different page structures
+        # Try multiple selectors
         articles = soup.select("article.entry-card")
         if not articles:
             articles = soup.select(".entry-card")
@@ -216,7 +226,7 @@ def get_latest_extraflix_urls():
             articles = soup.select(".post-item")
         if not articles:
             articles = soup.select("div[class*='post']")
-            
+        
         logger.info(f"[ExtraFlix] Found {len(articles)} articles")
         
         urls = []
@@ -232,63 +242,25 @@ def get_latest_extraflix_urls():
             
             if title_link and title_link.get("href"):
                 url = title_link["href"].strip()
-                if url and url.startswith("http"):
-                    urls.append(url)
-                elif url:
-                    # Handle relative URLs
-                    full_url = urljoin(EXTRAFLIX_URL, url)
-                    urls.append(full_url)
-
-        logger.info(f"[ExtraFlix] Found {len(urls)} post URLs")
-        return urls
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            logger.error("[ExtraFlix] 403 Forbidden - Website blocking bot. Trying alternative method...")
-            # Try with different user agents
-            return get_latest_extraflix_urls_alternative()
-    except Exception as e:
-        logger.error(f"[ExtraFlix] Homepage scrape failed: {e}")
-        return []
-
-
-def get_latest_extraflix_urls_alternative():
-    """Alternative method to scrape ExtraFlix using different headers"""
-    try:
-        ua = UserAgent()
-        headers = {
-            "User-Agent": ua.random,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
-        }
-        
-        resp = requests.get(EXTRAFLIX_URL, headers=headers, timeout=30)
-        resp.raise_for_status()
-        
-        soup = BeautifulSoup(resp.text, "html.parser")
-        articles = soup.select("article.entry-card")
-        
-        urls = []
-        for article in articles[:TOP_N]:
-            title_link = article.select_one("h2.entry-title a")
-            if title_link and title_link.get("href"):
-                url = title_link["href"].strip()
                 if url:
+                    # Handle relative URLs
+                    if not url.startswith("http"):
+                        url = urljoin(EXTRAFLIX_URL, url)
                     urls.append(url)
         
-        logger.info(f"[ExtraFlix Alternative] Found {len(urls)} post URLs")
-        return urls
+        logger.info(f"[ExtraFlix] Found {len(urls)} post URLs")
         
+        # Log first few URLs for debugging
+        if urls:
+            logger.info(f"[ExtraFlix] Sample URLs: {urls[:3]}")
+        
+        return urls
+
+    except cloudscraper.exceptions.CloudflareChallengeError as e:
+        logger.error(f"[ExtraFlix] Cloudflare challenge failed: {e}")
+        return []
     except Exception as e:
-        logger.error(f"[ExtraFlix Alternative] Failed: {e}")
+        logger.error(f"[ExtraFlix] Scrape failed: {e}")
         return []
 
 
