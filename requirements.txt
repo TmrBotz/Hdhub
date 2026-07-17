@@ -1,5 +1,6 @@
-fastapi==0.111.0
-uvicorn==0.29.0
-httpx==0.27.0
-motor
+requests
+beautifulsoup4
 pymongo
+flask
+schedule
+python-dotenv
