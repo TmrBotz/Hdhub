@@ -4,3 +4,4 @@ pymongo
 flask
 schedule
 python-dotenv
+fake-useragent==2.0.3
