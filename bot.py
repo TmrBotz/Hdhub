@@ -86,26 +86,42 @@ def scrape_post(post_url):
         return None
 
 
+SKIP_FROM_LABEL = "4K | SDR | HDR | DV"
+
+def filter_links(raw_links):
+    """
+    Filter download links:
+    - Skip all links with type=watch
+    - Once label == SKIP_FROM_LABEL is found, skip that + everything after it
+    """
+    filtered = []
+    for link in raw_links:
+        label = link.get("label", "").strip()
+        url = link.get("url", "").strip()
+        link_type = link.get("type", "download")
+
+        # Skip watch links entirely
+        if link_type == "watch":
+            continue
+
+        # Skip empty URLs
+        if not url:
+            continue
+
+        # If this label matches the cutoff, stop processing
+        if label == SKIP_FROM_LABEL:
+            break
+
+        filtered.append((label, url))
+
+    return filtered
+
+
 def build_message(data):
     """Build Telegram HTML message from scraped data."""
     title = html.unescape(data.get("title", "Unknown Title"))
 
-    # Separate download and watch links
-    download_links = []
-    watch_links = []
-
-    for link in data.get("download_links", []):
-        label = link.get("label", "Link")
-        url = link.get("url", "")
-        link_type = link.get("type", "download")
-
-        if not url:
-            continue
-
-        if link_type == "watch":
-            watch_links.append((label, url))
-        else:
-            download_links.append((label, url))
+    download_links = filter_links(data.get("download_links", []))
 
     # Build message
     lines = []
@@ -116,12 +132,8 @@ def build_message(data):
         lines.append("📥 <b>Download Links:</b>")
         for label, url in download_links:
             lines.append(f'• <a href="{url}">{html.escape(label)}</a>')
-
-    if watch_links:
-        lines.append("")
-        lines.append("▶️ <b>Watch Online:</b>")
-        for label, url in watch_links:
-            lines.append(f'• <a href="{url}">{html.escape(label)}</a>')
+    else:
+        lines.append("⚠️ No download links found.")
 
     return "\n".join(lines)
 
