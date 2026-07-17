@@ -214,7 +214,7 @@ def start_scheduler():
     # Run once immediately on startup
     run_job()
 
-    schedule.every(10).minutes.do(run_job)
+    schedule.every(5).minutes.do(run_job)
 
     while True:
         schedule.run_pending()
