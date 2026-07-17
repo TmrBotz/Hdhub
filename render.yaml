@@ -1,9 +1,16 @@
 services:
   - type: web
-    name: hdhub4u-api
+    name: hdhub4u-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: python bot.py
+    plan: free
     envVars:
-      - key: PYTHONUNBUFFERED
-        value: "1"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: PORT
+        value: 8080
