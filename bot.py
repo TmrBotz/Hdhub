@@ -19,6 +19,18 @@ SCRAPER_API = "https://sky-post-upload-jq4a.onrender.com/latest"
 HOMEPAGE_URL = "https://new3.hdhub4u.cl/"
 TOP_N = 10
 
+# Labels jahan se aage sab skip ho jata hai
+CUTOFF_LABELS = [
+    "4K | SDR | HDR | DV",
+    ": Single Episode x264 Links :",
+]
+
+# Ye labels hamesha skip honge chahe kahan bhi aayein
+SKIP_LABELS = [
+    "Drive",
+    "Instant",
+]
+
 # ─── MongoDB ──────────────────────────────────────────────────────────────────
 client = MongoClient(MONGO_URI)
 db = client["hdhub4u_bot"]
@@ -86,31 +98,35 @@ def scrape_post(post_url):
         return None
 
 
-SKIP_FROM_LABEL = "4K | SDR | HDR | DV"
-
 def filter_links(raw_links):
     """
-    Filter download links:
-    - Skip all links with type=watch
-    - Once label == SKIP_FROM_LABEL is found, skip that + everything after it
+    Filter rules:
+    1. type=watch          → hamesha skip
+    2. label in SKIP_LABELS → hamesha skip (Drive, Instant)
+    3. label in CUTOFF_LABELS → yahan se aage sab skip (break)
+    4. empty url           → skip
     """
     filtered = []
     for link in raw_links:
         label = link.get("label", "").strip()
-        url = link.get("url", "").strip()
-        link_type = link.get("type", "download")
+        url   = link.get("url", "").strip()
+        ltype = link.get("type", "download")
 
-        # Skip watch links entirely
-        if link_type == "watch":
+        # Rule 1: watch links skip
+        if ltype == "watch":
             continue
 
-        # Skip empty URLs
+        # Rule 4: empty url skip
         if not url:
             continue
 
-        # If this label matches the cutoff, stop processing
-        if label == SKIP_FROM_LABEL:
+        # Rule 3: cutoff label → stop completely
+        if label in CUTOFF_LABELS:
             break
+
+        # Rule 2: always-skip labels
+        if label in SKIP_LABELS:
+            continue
 
         filtered.append((label, url))
 
@@ -120,10 +136,8 @@ def filter_links(raw_links):
 def build_message(data):
     """Build Telegram HTML message from scraped data."""
     title = html.unescape(data.get("title", "Unknown Title"))
-
     download_links = filter_links(data.get("download_links", []))
 
-    # Build message
     lines = []
     lines.append(f"<b>{html.escape(title)}</b>")
     lines.append("")
@@ -150,7 +164,7 @@ def send_telegram(message):
         }
         resp = requests.post(url, json=payload, timeout=15)
         resp.raise_for_status()
-        print(f"[Telegram] Message sent successfully")
+        print("[Telegram] Message sent successfully")
         return True
 
     except Exception as e:
@@ -182,7 +196,7 @@ def run_job():
 
     new_count = 0
 
-    # Process in reverse so oldest new post gets sent first
+    # Reverse order taaki oldest post pehle bheje
     for url in reversed(post_urls):
         if is_already_sent(url):
             print(f"[Job] Already sent: {url}")
@@ -192,8 +206,7 @@ def run_job():
         data = scrape_post(url)
 
         if not data:
-            print(f"[Job] Scrape failed, skipping: {url}")
-            # Still mark to avoid retrying broken posts repeatedly
+            print(f"[Job] Scrape failed, marking & skipping: {url}")
             mark_as_sent(url, "unknown")
             continue
 
@@ -203,7 +216,7 @@ def run_job():
         if success:
             mark_as_sent(url, data.get("title", "unknown"))
             new_count += 1
-            time.sleep(2)  # small delay between messages
+            time.sleep(2)  # delay between messages
 
     print(f"[Job] Done. Sent {new_count} new posts.")
 
@@ -211,10 +224,10 @@ def run_job():
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 
 def start_scheduler():
-    # Run once immediately on startup
+    # Startup pe turant ek baar run karo
     run_job()
 
-    schedule.every(5).minutes.do(run_job)
+    schedule.every(10).minutes.do(run_job)
 
     while True:
         schedule.run_pending()
