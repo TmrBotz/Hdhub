@@ -9,14 +9,18 @@ from pymongo import MongoClient
 from flask import Flask
 from dotenv import load_dotenv
 import json
-from urllib.parse import urlparse, urljoin
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # Channel 1 (HDHub4u style)
-TELEGRAM_CHANNEL_ID_2 = os.getenv("TELEGRAM_CHANNEL_ID_2")  # Channel 2 (ExtraFlix)
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+TELEGRAM_CHANNEL_ID_2 = os.getenv("TELEGRAM_CHANNEL_ID_2")
 MONGO_URI = os.getenv("MONGO_URI")
 
 # APIs
@@ -29,30 +33,36 @@ EXTRAFLIX_URL = "https://e5.extraflix.mobi/"
 
 TOP_N = 10
 
-# Labels jahan se aage sab skip ho jata hai (for HDHub4u)
+# Labels for HDHub4u
 CUTOFF_LABELS = [
     "4K | SDR | HDR | DV",
     ": Single Episode x264 Links :",
 ]
 
-# Ye labels hamesha skip honge chahe kahan bhi aayein (for HDHub4u)
 SKIP_LABELS = [
     "Drive",
     "Instant",
 ]
 
 # ─── MongoDB ──────────────────────────────────────────────────────────────────
-client = MongoClient(MONGO_URI)
-db = client["hdhub4u_bot"]
-col_hdhub4u = db["sent_posts"]
-col_extraflix = db["sent_posts_extraflix"]
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client["hdhub4u_bot"]
+    col_hdhub4u = db["sent_posts"]
+    col_extraflix = db["sent_posts_extraflix"]
+    # Test connection
+    client.admin.command('ping')
+    logger.info("✅ MongoDB connected successfully")
+except Exception as e:
+    logger.error(f"❌ MongoDB connection failed: {e}")
+    exit(1)
 
 # ─── Flask ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "HDHub4u & ExtraFlix Bot is running!", 200
+    return {"status": "running", "message": "HDHub4u & ExtraFlix Bot is running!"}, 200
 
 @app.route("/status")
 def status():
@@ -68,13 +78,9 @@ def get_latest_hdhub4u_urls():
     """Scrape HDHub4u homepage and return top N post URLs."""
     try:
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
-        resp = requests.get(HOMEPAGE_URL, headers=headers, timeout=20)
+        resp = requests.get(HOMEPAGE_URL, headers=headers, timeout=30)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -84,46 +90,52 @@ def get_latest_hdhub4u_urls():
         for li in movie_list[:TOP_N]:
             a = li.select_one("figcaption a")
             if a and a.get("href"):
-                urls.append(a["href"].strip())
+                url = a["href"].strip()
+                if url:
+                    urls.append(url)
 
-        print(f"[HDHub4u] Found {len(urls)} post URLs")
+        logger.info(f"[HDHub4u] Found {len(urls)} post URLs")
         return urls
 
+    except requests.exceptions.Timeout:
+        logger.error("[HDHub4u] Homepage scrape timeout")
+        return []
+    except requests.exceptions.ConnectionError:
+        logger.error("[HDHub4u] Homepage connection error")
+        return []
     except Exception as e:
-        print(f"[HDHub4u] Homepage scrape failed: {e}")
+        logger.error(f"[HDHub4u] Homepage scrape failed: {e}")
         return []
 
 
 def scrape_hdhub4u_post(post_url):
     """Call HDHub4u scraper API and return data dict or None."""
     try:
+        logger.info(f"[HDHub4u API] Scraping: {post_url}")
         resp = requests.get(
             SCRAPER_API,
             params={"post": post_url},
-            timeout=30
+            timeout=45
         )
         resp.raise_for_status()
         data = resp.json()
 
         if not data.get("success"):
-            print(f"[HDHub4u API] Scraper returned success=false for {post_url}")
+            logger.warning(f"[HDHub4u API] success=false for {post_url}")
             return None
 
         return data
 
+    except requests.exceptions.Timeout:
+        logger.error(f"[HDHub4u API] Timeout for {post_url}")
+        return None
     except Exception as e:
-        print(f"[HDHub4u API] Failed for {post_url}: {e}")
+        logger.error(f"[HDHub4u API] Failed for {post_url}: {e}")
         return None
 
 
 def filter_hdhub4u_links(raw_links):
-    """
-    Filter rules for HDHub4u:
-    1. type=watch → hamesha skip
-    2. label in SKIP_LABELS → hamesha skip (Drive, Instant)
-    3. label in CUTOFF_LABELS → yahan se aage sab skip (break)
-    4. empty url → skip
-    """
+    """Filter rules for HDHub4u"""
     filtered = []
     for link in raw_links:
         label = link.get("label", "").strip()
@@ -132,13 +144,10 @@ def filter_hdhub4u_links(raw_links):
 
         if ltype == "watch":
             continue
-
         if not url:
             continue
-
         if label in CUTOFF_LABELS:
             break
-
         if label in SKIP_LABELS:
             continue
 
@@ -172,50 +181,56 @@ def get_latest_extraflix_urls():
     """Scrape ExtraFlix homepage and return top N post URLs."""
     try:
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
-        resp = requests.get(EXTRAFLIX_URL, headers=headers, timeout=20)
+        resp = requests.get(EXTRAFLIX_URL, headers=headers, timeout=30)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        # ExtraFlix uses article entries with class "entry-card"
         articles = soup.select("article.entry-card")
 
         urls = []
         for article in articles[:TOP_N]:
             title_link = article.select_one("h2.entry-title a")
             if title_link and title_link.get("href"):
-                urls.append(title_link["href"].strip())
+                url = title_link["href"].strip()
+                if url:
+                    urls.append(url)
 
-        print(f"[ExtraFlix] Found {len(urls)} post URLs")
+        logger.info(f"[ExtraFlix] Found {len(urls)} post URLs")
         return urls
 
+    except requests.exceptions.Timeout:
+        logger.error("[ExtraFlix] Homepage scrape timeout")
+        return []
+    except requests.exceptions.ConnectionError:
+        logger.error("[ExtraFlix] Homepage connection error")
+        return []
     except Exception as e:
-        print(f"[ExtraFlix] Homepage scrape failed: {e}")
+        logger.error(f"[ExtraFlix] Homepage scrape failed: {e}")
         return []
 
 
 def scrape_extraflix_post(post_url):
     """Call ExtraFlix API and return data dict or None."""
     try:
-        # API expects URL as query parameter
         full_url = f"{EXTRA_API}?url={post_url}"
-        resp = requests.get(full_url, timeout=30)
+        logger.info(f"[ExtraFlix API] Scraping: {post_url}")
+        resp = requests.get(full_url, timeout=45)
         resp.raise_for_status()
         data = resp.json()
 
         if not data.get("success"):
-            print(f"[ExtraFlix API] Scraper returned success=false for {post_url}")
+            logger.warning(f"[ExtraFlix API] success=false for {post_url}")
             return None
 
         return data
 
+    except requests.exceptions.Timeout:
+        logger.error(f"[ExtraFlix API] Timeout for {post_url}")
+        return None
     except Exception as e:
-        print(f"[ExtraFlix API] Failed for {post_url}: {e}")
+        logger.error(f"[ExtraFlix API] Failed for {post_url}: {e}")
         return None
 
 
@@ -235,13 +250,11 @@ def build_extraflix_message(data):
             file_size = link.get("fileSize", "")
             mirrors = link.get("mirrors", [])
             
-            # Show first mirror only (or all if you want)
             if mirrors:
                 first_mirror = mirrors[0]
                 lines.append(f'• <a href="{first_mirror}">{html.escape(file_info)}</a>')
                 if file_size:
                     lines.append(f'  <i>({html.escape(file_size)})</i>')
-                # If there are multiple mirrors, show count
                 if len(mirrors) > 1:
                     lines.append(f'  <i>+ {len(mirrors)-1} more mirror(s)</i>')
                 lines.append("")
@@ -265,11 +278,11 @@ def send_telegram(message, chat_id):
         }
         resp = requests.post(url, json=payload, timeout=15)
         resp.raise_for_status()
-        print(f"[Telegram] Message sent successfully to {chat_id}")
+        logger.info(f"[Telegram] Message sent to {chat_id}")
         return True
 
     except Exception as e:
-        print(f"[Telegram] Send failed to {chat_id}: {e}")
+        logger.error(f"[Telegram] Send failed to {chat_id}: {e}")
         return False
 
 
@@ -285,132 +298,135 @@ def mark_as_sent(collection, post_url, title):
     )
 
 
-# ─── Main Job for HDHub4u ──────────────────────────────────────────────────
+# ─── Main Jobs ──────────────────────────────────────────────────────────────
 
 def run_hdhub4u_job():
-    print("[Job] Starting HDHub4u check...")
+    logger.info("🔄 Starting HDHub4u check...")
 
     post_urls = get_latest_hdhub4u_urls()
     if not post_urls:
-        print("[Job HDHub4u] No URLs found, skipping.")
+        logger.warning("[HDHub4u] No URLs found")
         return
 
     new_count = 0
-
     for url in reversed(post_urls):
-        if is_already_sent(col_hdhub4u, url):
-            print(f"[Job HDHub4u] Already sent: {url}")
-            continue
+        try:
+            if is_already_sent(col_hdhub4u, url):
+                logger.debug(f"[HDHub4u] Already sent: {url}")
+                continue
 
-        print(f"[Job HDHub4u] New post found: {url}")
-        data = scrape_hdhub4u_post(url)
+            logger.info(f"[HDHub4u] New post: {url}")
+            data = scrape_hdhub4u_post(url)
 
-        if not data:
-            print(f"[Job HDHub4u] Scrape failed, marking & skipping: {url}")
-            mark_as_sent(col_hdhub4u, url, "unknown")
-            continue
+            if not data:
+                logger.warning(f"[HDHub4u] Scrape failed, marking: {url}")
+                mark_as_sent(col_hdhub4u, url, "unknown")
+                continue
 
-        message = build_hdhub4u_message(data)
-        success = send_telegram(message, TELEGRAM_CHANNEL_ID)
+            message = build_hdhub4u_message(data)
+            success = send_telegram(message, TELEGRAM_CHANNEL_ID)
 
-        if success:
-            mark_as_sent(col_hdhub4u, url, data.get("title", "unknown"))
-            new_count += 1
-            time.sleep(2)
+            if success:
+                mark_as_sent(col_hdhub4u, url, data.get("title", "unknown"))
+                new_count += 1
+                time.sleep(2)
+        except Exception as e:
+            logger.error(f"[HDHub4u] Error processing {url}: {e}")
 
-    print(f"[Job HDHub4u] Done. Sent {new_count} new posts.")
+    logger.info(f"[HDHub4u] Sent {new_count} new posts")
 
-
-# ─── Main Job for ExtraFlix ─────────────────────────────────────────────────
 
 def run_extraflix_job():
-    print("[Job] Starting ExtraFlix check...")
+    logger.info("🔄 Starting ExtraFlix check...")
 
     post_urls = get_latest_extraflix_urls()
     if not post_urls:
-        print("[Job ExtraFlix] No URLs found, skipping.")
+        logger.warning("[ExtraFlix] No URLs found")
         return
 
     new_count = 0
-
     for url in reversed(post_urls):
-        if is_already_sent(col_extraflix, url):
-            print(f"[Job ExtraFlix] Already sent: {url}")
-            continue
+        try:
+            if is_already_sent(col_extraflix, url):
+                logger.debug(f"[ExtraFlix] Already sent: {url}")
+                continue
 
-        print(f"[Job ExtraFlix] New post found: {url}")
-        data = scrape_extraflix_post(url)
+            logger.info(f"[ExtraFlix] New post: {url}")
+            data = scrape_extraflix_post(url)
 
-        if not data:
-            print(f"[Job ExtraFlix] Scrape failed, marking & skipping: {url}")
-            mark_as_sent(col_extraflix, url, "unknown")
-            continue
+            if not data:
+                logger.warning(f"[ExtraFlix] Scrape failed, marking: {url}")
+                mark_as_sent(col_extraflix, url, "unknown")
+                continue
 
-        message = build_extraflix_message(data)
-        success = send_telegram(message, TELEGRAM_CHANNEL_ID_2)
+            message = build_extraflix_message(data)
+            success = send_telegram(message, TELEGRAM_CHANNEL_ID_2)
 
-        if success:
-            mark_as_sent(col_extraflix, url, data.get("title", "unknown"))
-            new_count += 1
-            time.sleep(2)
+            if success:
+                mark_as_sent(col_extraflix, url, data.get("title", "unknown"))
+                new_count += 1
+                time.sleep(2)
+        except Exception as e:
+            logger.error(f"[ExtraFlix] Error processing {url}: {e}")
 
-    print(f"[Job ExtraFlix] Done. Sent {new_count} new posts.")
+    logger.info(f"[ExtraFlix] Sent {new_count} new posts")
 
-
-# ─── Combined Job ────────────────────────────────────────────────────────────
 
 def run_all_jobs():
     """Run both jobs together"""
-    print("\n" + "="*50)
-    print("Running both jobs...")
-    print("="*50 + "\n")
+    logger.info("="*50)
+    logger.info("🚀 Running both jobs...")
+    logger.info("="*50)
     
     run_hdhub4u_job()
-    print("\n" + "-"*30 + "\n")
+    logger.info("-"*30)
     run_extraflix_job()
     
-    print("\n" + "="*50)
-    print("Both jobs completed!")
-    print("="*50 + "\n")
+    logger.info("="*50)
+    logger.info("✅ Both jobs completed!")
+    logger.info("="*50)
 
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 
 def start_scheduler():
-    # Startup pe turant ek baar run karo
+    # Wait 5 seconds before first run to let Flask start
+    time.sleep(5)
+    logger.info("🚀 Running initial job...")
     run_all_jobs()
 
-    # Schedule both jobs every 10 minutes
+    # Schedule every 10 minutes
     schedule.every(10).minutes.do(run_all_jobs)
+    logger.info("⏰ Scheduler started - running every 10 minutes")
 
     while True:
-        schedule.run_pending()
-        time.sleep(30)
+        try:
+            schedule.run_pending()
+            time.sleep(30)
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            time.sleep(60)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Check required environment variables
-    required_vars = [
-        "TELEGRAM_BOT_TOKEN",
-        "TELEGRAM_CHANNEL_ID",
-        "TELEGRAM_CHANNEL_ID_2",
-        "MONGO_URI"
-    ]
-    
+    # Check environment variables
+    required_vars = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_ID", "TELEGRAM_CHANNEL_ID_2", "MONGO_URI"]
     missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
     if missing_vars:
-        print(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
-        print("Please set them in your .env file or environment.")
+        logger.error(f"❌ Missing: {', '.join(missing_vars)}")
         exit(1)
     
-    print("✅ All environment variables set. Starting bot...")
+    logger.info("✅ All environment variables set")
     
-    # Start scheduler in background thread
-    thread = threading.Thread(target=start_scheduler, daemon=True)
-    thread.start()
+    # Start scheduler
+    scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
+    scheduler_thread.start()
+    logger.info("🔄 Scheduler thread started")
 
-    # Start Flask app
+    # Start Flask
     port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    logger.info(f"🌐 Starting Flask server on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
