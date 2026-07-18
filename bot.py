@@ -32,14 +32,14 @@ SKIP_LABELS = [
 ]
 
 # ExtraFlix
-EXTRAFLIX_HOMEPAGE   = "https://e5.extraflix.mobi/"
+EXTRAFLIX_HOMEPAGE    = "https://e5.extraflix.mobi/"
 EXTRAFLIX_SCRAPER_API = "https://extraapi.tmrbotz.workers.dev/scrape"
-EXTRAFLIX_TOP_N      = 10
+EXTRAFLIX_TOP_N       = 10
 
 # ─── MongoDB ──────────────────────────────────────────────────────────────────
-client       = MongoClient(MONGO_URI)
-db           = client["hdhub4u_bot"]
-col          = db["sent_posts"]
+client        = MongoClient(MONGO_URI)
+db            = client["hdhub4u_bot"]
+col           = db["sent_posts"]
 col_extraflix = db["extraflix_sent_posts"]
 
 # ─── Flask ────────────────────────────────────────────────────────────────────
@@ -360,8 +360,9 @@ def run_extraflix_job():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def start_scheduler():
-    run_job()
-    run_extraflix_job()
+    # Startup pe dono alag threads mein chalao
+    threading.Thread(target=run_job, daemon=True).start()
+    threading.Thread(target=run_extraflix_job, daemon=True).start()
 
     schedule.every(10).minutes.do(run_job)
     schedule.every(10).minutes.do(run_extraflix_job)
