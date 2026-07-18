@@ -16,11 +16,9 @@ TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID  = os.getenv("TELEGRAM_CHANNEL_ID")
 EXTRAFLIX_CHANNEL_ID = os.getenv("EXTRAFLIX_CHANNEL_ID")
 MONGO_URI            = os.getenv("MONGO_URI")
-
-# HDHub4u
-SCRAPER_API  = "https://sky-post-upload-jq4a.onrender.com/latest"
-HOMEPAGE_URL = "https://new3.hdhub4u.cl/"
-TOP_N        = 10
+SCRAPER_API          = "https://sky-post-upload-jq4a.onrender.com/latest"
+HOMEPAGE_URL         = "https://new3.hdhub4u.cl/"
+TOP_N                = 10
 
 CUTOFF_LABELS = [
     "4K | SDR | HDR | DV",
@@ -31,7 +29,6 @@ SKIP_LABELS = [
     "Instant",
 ]
 
-# ExtraFlix
 EXTRAFLIX_HOMEPAGE    = "https://e5.extraflix.mobi/"
 EXTRAFLIX_SCRAPER_API = "https://extraapi.tmrbotz.workers.dev/scrape"
 EXTRAFLIX_TOP_N       = 10
@@ -47,36 +44,13 @@ app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "Bot is running!", 200
+    return "HDHub4u Bot is running!", 200
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SHARED
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def send_telegram(message, chat_id):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        resp = requests.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        print(f"[Telegram] Message sent to {chat_id}")
-        return True
-    except Exception as e:
-        print(f"[Telegram] Send failed: {e}")
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# HDHUB4U
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_latest_post_urls():
+    """Scrape homepage and return top N post URLs."""
     try:
         headers = {
             "User-Agent": (
@@ -97,15 +71,16 @@ def get_latest_post_urls():
             if a and a.get("href"):
                 urls.append(a["href"].strip())
 
-        print(f"[HDHub4u Scraper] Found {len(urls)} post URLs")
+        print(f"[Scraper] Found {len(urls)} post URLs")
         return urls
 
     except Exception as e:
-        print(f"[HDHub4u Scraper] Homepage scrape failed: {e}")
+        print(f"[Scraper] Homepage scrape failed: {e}")
         return []
 
 
 def scrape_post(post_url):
+    """Call scraper API and return data dict or None."""
     try:
         resp = requests.get(
             SCRAPER_API,
@@ -116,13 +91,13 @@ def scrape_post(post_url):
         data = resp.json()
 
         if not data.get("success"):
-            print(f"[HDHub4u API] success=false for {post_url}")
+            print(f"[API] Scraper returned success=false for {post_url}")
             return None
 
         return data
 
     except Exception as e:
-        print(f"[HDHub4u API] Failed for {post_url}: {e}")
+        print(f"[API] Failed for {post_url}: {e}")
         return None
 
 
@@ -143,15 +118,17 @@ def filter_links(raw_links):
             continue
 
         filtered.append((label, url))
+
     return filtered
 
 
-def build_hdhub4u_message(data):
+def build_message(data):
+    """Build Telegram HTML message from scraped data."""
     title = html.unescape(data.get("title", "Unknown Title"))
     download_links = filter_links(data.get("download_links", []))
 
     lines = []
-    lines.append(f"🎬 <b>{html.escape(title)}</b>")
+    lines.append(f"<b>{html.escape(title)}</b>")
     lines.append("")
 
     if download_links:
@@ -161,10 +138,27 @@ def build_hdhub4u_message(data):
     else:
         lines.append("⚠️ No download links found.")
 
-    lines.append("")
-    lines.append("<i>Source: HDHub4u</i>")
-
     return "\n".join(lines)
+
+
+def send_telegram(message, chat_id):
+    """Send message to Telegram channel."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        print("[Telegram] Message sent successfully")
+        return True
+
+    except Exception as e:
+        print(f"[Telegram] Send failed: {e}")
+        return False
 
 
 def is_already_sent(post_url):
@@ -179,30 +173,32 @@ def mark_as_sent(post_url, title):
     )
 
 
+# ─── Main Job ─────────────────────────────────────────────────────────────────
+
 def run_job():
-    print("[HDHub4u Job] Starting check...")
+    print("[Job] Starting check...")
 
     post_urls = get_latest_post_urls()
     if not post_urls:
-        print("[HDHub4u Job] No URLs found, skipping.")
+        print("[Job] No URLs found, skipping.")
         return
 
     new_count = 0
 
     for url in reversed(post_urls):
         if is_already_sent(url):
-            print(f"[HDHub4u Job] Already sent: {url}")
+            print(f"[Job] Already sent: {url}")
             continue
 
-        print(f"[HDHub4u Job] New post: {url}")
+        print(f"[Job] New post found: {url}")
         data = scrape_post(url)
 
         if not data:
-            print(f"[HDHub4u Job] Scrape failed, marking & skipping: {url}")
+            print(f"[Job] Scrape failed, marking & skipping: {url}")
             mark_as_sent(url, "unknown")
             continue
 
-        message = build_hdhub4u_message(data)
+        message = build_message(data)
         success = send_telegram(message, TELEGRAM_CHANNEL_ID)
 
         if success:
@@ -210,12 +206,10 @@ def run_job():
             new_count += 1
             time.sleep(2)
 
-    print(f"[HDHub4u Job] Done. Sent {new_count} new posts.")
+    print(f"[Job] Done. Sent {new_count} new posts.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXTRAFLIX
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── ExtraFlix ────────────────────────────────────────────────────────────────
 
 def get_extraflix_post_urls():
     try:
@@ -272,7 +266,7 @@ def build_extraflix_message(data):
     links = data.get("links", [])
 
     lines = []
-    lines.append(f"🎬 <b>{html.escape(title)}</b>")
+    lines.append(f"<b>{html.escape(title)}</b>")
     lines.append("")
 
     if links:
@@ -302,9 +296,6 @@ def build_extraflix_message(data):
             lines.append(f"  {mirrors_str}")
     else:
         lines.append("⚠️ No download links found.")
-
-    lines.append("")
-    lines.append("<i>Source: ExtraFlix</i>")
 
     return "\n".join(lines)
 
@@ -336,7 +327,7 @@ def run_extraflix_job():
             print(f"[ExtraFlix Job] Already sent: {url}")
             continue
 
-        print(f"[ExtraFlix Job] New post: {url}")
+        print(f"[ExtraFlix Job] New post found: {url}")
         data = scrape_extraflix_post(url)
 
         if not data:
@@ -355,14 +346,12 @@ def run_extraflix_job():
     print(f"[ExtraFlix Job] Done. Sent {new_count} new posts.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SCHEDULER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Scheduler ────────────────────────────────────────────────────────────────
 
 def start_scheduler():
-    # Startup pe dono alag threads mein chalao
-    threading.Thread(target=run_job, daemon=True).start()
-    threading.Thread(target=run_extraflix_job, daemon=True).start()
+    # Startup pe turant ek baar run karo
+    run_job()
+    run_extraflix_job()
 
     schedule.every(10).minutes.do(run_job)
     schedule.every(10).minutes.do(run_extraflix_job)
@@ -372,9 +361,7 @@ def start_scheduler():
         time.sleep(30)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     thread = threading.Thread(target=start_scheduler, daemon=True)
